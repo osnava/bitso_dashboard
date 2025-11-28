@@ -60,6 +60,22 @@ def fetch_live_prices() -> Dict[str, float]:
     return prices
 
 
+def fetch_live_usdt_mxn_rate() -> float:
+    """Fetch current USDT/MXN rate from Bitso API."""
+    url = 'https://api.bitso.com/v3/ticker/?book=usdt_mxn'
+
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    data = response.json()
+
+    if data.get('success') and 'payload' in data:
+        # Get the last price from the ticker
+        last_price = float(data['payload']['last'])
+        return last_price
+
+    raise Exception("Failed to fetch USDT/MXN rate from Bitso API")
+
+
 def safe_float(value: str) -> float:
     """Convert string to float, return 0.0 if invalid."""
     try:
@@ -134,25 +150,33 @@ def list_cold_wallet() -> None:
 class EnhancedBalanceCalculator:
     """Calculate cryptocurrency balances with USD values and metrics."""
 
-    def __init__(self, use_live_prices: bool = False):
+    def __init__(self):
         self.inflow: Dict[str, float] = defaultdict(float)
         self.outflow: Dict[str, float] = defaultdict(float)
         self.fees: Dict[str, float] = defaultdict(float)
         self.trades: List[Dict] = []
         self.conversions: List[Dict] = []
         self.funding: Dict[str, float] = defaultdict(float)
-        self.use_live_prices = use_live_prices
         self.live_prices: Dict[str, float] = {}
+        self.live_usdt_mxn_rate: Optional[float] = None
 
-        if self.use_live_prices:
-            console.print("Fetching live prices from CoinGecko...", style="cyan")
-            try:
-                self.live_prices = fetch_live_prices()
-                console.print(f"Fetched prices for {len(self.live_prices)} cryptocurrencies\n", style="green")
-            except Exception as e:
-                console.print(f"\nFailed to fetch live prices from API", style="bold red")
-                console.print(f"Error: {str(e)}\n", style="red")
-                raise SystemExit(1)
+        console.print("Fetching live prices from CoinGecko...", style="cyan")
+        try:
+            self.live_prices = fetch_live_prices()
+            console.print(f"Fetched prices for {len(self.live_prices)} cryptocurrencies", style="green")
+        except Exception as e:
+            console.print(f"\nFailed to fetch live prices from CoinGecko API", style="bold red")
+            console.print(f"Error: {str(e)}\n", style="red")
+            raise SystemExit(1)
+
+        console.print("Fetching live USDT/MXN rate from Bitso...", style="cyan")
+        try:
+            self.live_usdt_mxn_rate = fetch_live_usdt_mxn_rate()
+            console.print(f"Live USDT/MXN rate: {self.live_usdt_mxn_rate:.2f}\n", style="green")
+        except Exception as e:
+            console.print(f"\nFailed to fetch live USDT/MXN rate from Bitso API", style="bold red")
+            console.print(f"Error: {str(e)}\n", style="red")
+            raise SystemExit(1)
 
     def process_funding(self, filepath: Path) -> None:
         """Process funding transactions from CSV."""
@@ -237,24 +261,14 @@ class EnhancedBalanceCalculator:
         }
 
     def get_mxn_to_usdt_rate(self) -> float:
-        """Get MXN/USDT conversion rate from trade history."""
-        usdt_mxn_trades = [t for t in self.trades
-                          if t['major'] == 'usdt' and t['minor'] == 'mxn']
+        """Get MXN/USDT conversion rate from live API."""
+        if self.live_usdt_mxn_rate is not None:
+            return self.live_usdt_mxn_rate
 
-        if usdt_mxn_trades:
-            return usdt_mxn_trades[-1]['rate']
-
-        mxn_usdt_conversions = [c for c in self.conversions
-                               if c['from'] == 'mxn' and c['to'] == 'usdt']
-
-        if mxn_usdt_conversions:
-            conv = mxn_usdt_conversions[-1]
-            return conv['from_amount'] / conv['to_amount']
-
-        return 20.0
+        raise Exception("Live USDT/MXN rate not available")
 
     def get_latest_price_usdt(self, currency: str) -> float:
-        """Get latest price in USDT (live or historical)."""
+        """Get latest price in USDT from live API."""
         if currency == 'usdt':
             return 1.0
         if currency == 'usd':
@@ -262,28 +276,12 @@ class EnhancedBalanceCalculator:
         if currency == 'mxn':
             return 1.0 / self.get_mxn_to_usdt_rate()
 
-        if self.use_live_prices:
-            if currency in self.live_prices:
-                return self.live_prices[currency]
-            else:
-                console.print(f"\nNo live price available for {currency.upper()}", style="bold red")
-                console.print(f"Supported coins: {', '.join(COIN_IDS.keys()).upper()}\n", style="yellow")
-                raise SystemExit(1)
-
-        usdt_trades = [t for t in self.trades
-                      if t['major'] == currency and t['minor'] == 'usdt']
-
-        if usdt_trades:
-            return usdt_trades[-1]['rate']
-
-        mxn_trades = [t for t in self.trades
-                     if t['major'] == currency and t['minor'] == 'mxn']
-
-        if mxn_trades:
-            mxn_rate = self.get_mxn_to_usdt_rate()
-            return mxn_trades[-1]['rate'] / mxn_rate
-
-        return 0.0
+        if currency in self.live_prices:
+            return self.live_prices[currency]
+        else:
+            console.print(f"\nNo live price available for {currency.upper()}", style="bold red")
+            console.print(f"Supported coins: {', '.join(COIN_IDS.keys()).upper()}\n", style="yellow")
+            raise SystemExit(1)
 
     def get_usd_value(self, currency: str, amount: float) -> float:
         """Calculate USD value for amount of currency."""
@@ -389,6 +387,51 @@ class EnhancedBalanceCalculator:
         header_text.append(f"({roi_pct:+.2f}%)", style=f"bold {pnl_color}")
 
         console.print(Panel(header_text, box=box.DOUBLE, border_style="cyan"))
+        console.print()
+
+        # Deposits Summary Table
+        deposits_table = Table(
+            title="Deposits Summary (Historical - What You Put In)",
+            box=box.ROUNDED,
+            show_header=True,
+            header_style="bold cyan"
+        )
+
+        deposits_table.add_column("Type", style="cyan", justify="left")
+        deposits_table.add_column("Amount", justify="right", style="white")
+        deposits_table.add_column("Notes", justify="left", style="dim")
+
+        # Add deposit rows
+        if self.funding.get('mxn', 0) > 0:
+            deposits_table.add_row(
+                "MXN Deposited",
+                f"{self.funding['mxn']:,.2f} MXN",
+                "Via SPEI transfers"
+            )
+
+        if self.funding.get('usdt', 0) > 0:
+            deposits_table.add_row(
+                "USDT Deposited",
+                f"{self.funding['usdt']:.8f} USDT",
+                "Direct USDT transfers"
+            )
+
+        if self.funding.get('btc', 0) > 0:
+            deposits_table.add_row(
+                "BTC Deposited",
+                f"{self.funding['btc']:.8f} BTC",
+                "Direct BTC transfers"
+            )
+
+        # Show current exchange rate being used
+        mxn_rate = self.get_mxn_to_usdt_rate()
+        deposits_table.add_row(
+            "Current MXN/USDT Rate",
+            f"{mxn_rate:.2f}",
+            "Live from Bitso API"
+        )
+
+        console.print(deposits_table)
         console.print()
 
         bitso_table = Table(
@@ -671,24 +714,26 @@ class EnhancedBalanceCalculator:
 def main():
     """Main execution function with CLI support."""
     parser = argparse.ArgumentParser(
-        description='Enhanced Crypto Portfolio Tracker with Cold Wallet Support',
+        description='Crypto Portfolio Tracker with Live Prices (CoinGecko + Bitso APIs)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
-  # Show full portfolio report
-  python balance_improved.py
+  # Show full portfolio report with live prices
+  python balance.py
 
   # Add cold wallet holding
-  python balance_improved.py --add-cold btc 0.01
+  python balance.py --add-cold btc 0.01
 
   # Update existing holding
-  python balance_improved.py --add-cold eth 2.5
+  python balance.py --add-cold eth 2.5
 
   # Remove cold wallet holding
-  python balance_improved.py --remove-cold sol
+  python balance.py --remove-cold sol
 
   # List only cold wallet
-  python balance_improved.py --list-cold
+  python balance.py --list-cold
+
+Note: Live prices are always fetched from CoinGecko API and Bitso API
         '''
     )
 
@@ -709,12 +754,6 @@ Examples:
         '--list-cold',
         action='store_true',
         help='Show only cold wallet holdings'
-    )
-
-    parser.add_argument(
-        '--live-prices',
-        action='store_true',
-        help='Fetch live cryptocurrency prices from CoinGecko API'
     )
 
     args = parser.parse_args()
@@ -738,7 +777,7 @@ Examples:
         return
 
     # Default: Show full portfolio report
-    calculator = EnhancedBalanceCalculator(use_live_prices=args.live_prices)
+    calculator = EnhancedBalanceCalculator()
 
     # Process all transaction types
     calculator.process_funding(Path('funding.csv'))

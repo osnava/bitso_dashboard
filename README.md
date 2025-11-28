@@ -1,14 +1,16 @@
 # Bitso Portfolio Tracker
 
-Terminal-based cryptocurrency portfolio tracker for Bitso exchange data with cold wallet support.
+Terminal-based cryptocurrency portfolio tracker for Bitso exchange with **real-time live prices** and cold wallet support.
 
 ## Features
 
 ### Portfolio Dashboard
 - Total Portfolio Value in USD (Bitso + Cold Wallet)
 - Total Invested (MXN + USDT deposits converted to USD)
+- Deposits Summary (shows actual MXN/USDT/BTC deposited)
 - Profit & Loss with ROI percentage
 - Color-coded terminal output
+- **Always uses live prices** - no stale data
 
 ### Current Holdings
 - Bitso Exchange holdings table
@@ -22,17 +24,19 @@ Terminal-based cryptocurrency portfolio tracker for Bitso exchange data with col
 
 ### Average Buy Prices & Unrealized P&L
 - Average buy price for each crypto (in USDT)
-- Current market price (live from CoinGecko or historical from trades)
+- Current market price (live from CoinGecko API)
 - Unrealized profit/loss per asset
 - Color-coded (green = profit, red = loss)
 - Uses weighted average cost basis accounting
 
-### Live Prices
-- Fetch real-time cryptocurrency prices from CoinGecko API
-- Supports: BTC, ETH, SOL, XRP, USDT, and 11 more coins
-- No fallbacks - throws error if API fails (ensures data accuracy)
-- Free API, no registration required
-- Use `--live-prices` flag to enable, or omit for historical prices
+### Live Prices (Always Enabled)
+- **Cryptocurrency prices:** CoinGecko API
+  - Supports: BTC, ETH, SOL, XRP, USDT, and 11 more coins
+  - Free API, no registration required
+- **USDT/MXN exchange rate:** Bitso API
+  - Real-time market rate for accurate MXN conversions
+  - Essential for correct cost basis calculations
+- **No hardcoded fallbacks** - program fails if APIs are unreachable (ensures data accuracy)
 
 ### Fees Tracking
 - Total fees paid per currency
@@ -42,25 +46,24 @@ Terminal-based cryptocurrency portfolio tracker for Bitso exchange data with col
 ## Quick Start
 
 ```bash
-# Run the portfolio tracker with live prices
-python3 balance_improved.py --live-prices
-
-# Without live prices (uses historical from trades)
-python3 balance_improved.py
+# Run the portfolio tracker (always fetches live prices)
+python3 balance.py
 
 # Add cold wallet holdings
-python3 balance_improved.py --add-cold btc 0.01
-python3 balance_improved.py --add-cold eth 0.5
+python3 balance.py --add-cold btc 0.01
+python3 balance.py --add-cold eth 0.5
 
 # List cold wallet only
-python3 balance_improved.py --list-cold
+python3 balance.py --list-cold
 
 # Remove cold wallet holding
-python3 balance_improved.py --remove-cold sol
+python3 balance.py --remove-cold sol
 
 # Show help
-python3 balance_improved.py --help
+python3 balance.py --help
 ```
+
+**Note:** Internet connection required - the program fetches live prices from CoinGecko and Bitso APIs on every run.
 
 ## Cold Wallet Management
 
@@ -68,54 +71,23 @@ Track your Ledger, Trezor, or other cold storage holdings alongside your Bitso e
 
 ```bash
 # Add 0.01 BTC to cold wallet
-python3 balance_improved.py --add-cold btc 0.01
+python3 balance.py --add-cold btc 0.01
 
 # Update to 2.5 ETH (overwrites previous amount)
-python3 balance_improved.py --add-cold eth 2.5
+python3 balance.py --add-cold eth 2.5
 
 # View only cold wallet holdings
-python3 balance_improved.py --list-cold
+python3 balance.py --list-cold
 
 # Remove SOL from cold wallet
-python3 balance_improved.py --remove-cold sol
+python3 balance.py --remove-cold sol
 ```
 
 Cold wallet data is stored in `cold_wallet.json` and automatically included in your total portfolio value.
 
-## Price Modes
-
-The tracker supports two price modes:
-
-### Live Prices Mode (`--live-prices`)
-- Fetches real-time prices from CoinGecko API
-- More accurate current portfolio valuation
-- Strict mode: Fails immediately if:
-  - API is unreachable (no internet, API down)
-  - Coin not supported by CoinGecko
-  - No price data returned
-- Recommended for accurate current valuations
-
-```bash
-python3 balance_improved.py --live-prices
-```
-
-### Historical Prices Mode (default)
-- Uses prices from your latest trades in CSV files
-- Works offline
-- Price may be outdated (based on your last trade)
-- Good for reviewing past positions
-
-```bash
-python3 balance_improved.py
-```
-
-Example difference:
-- Live: BTC @ $92,729 (current market)
-- Historical: BTC @ $94,944 (your last trade price)
-
 ## Project Structure
 
-- **balance_improved.py** - Main portfolio tracker with all features
+- **balance.py** - Main portfolio tracker with all features
 - **requirements.txt** - Python dependencies
 - **cold_wallet.json** - Cold wallet data storage (auto-created)
 - **samples/** - Sample CSV files showing expected format
@@ -128,40 +100,70 @@ The calculator processes your Bitso CSV files:
 3. **trade.csv** - Buy/sell trades
 4. **withdrawal.csv** - Withdrawals
 
+Then fetches live prices from:
+- **CoinGecko API** - Current cryptocurrency prices in USD
+- **Bitso API** - Current USDT/MXN exchange rate
+
 It calculates:
 - Net balance for each currency
-- USD values using latest trade prices
-- Average buy prices (weighted by amount)
-- Unrealized P&L
-- Total portfolio metrics
+- USD values using **live market prices**
+- Average buy prices (weighted by amount from trade history)
+- Unrealized P&L (current value - cost basis)
+- Total portfolio metrics with accurate cost basis
 
 ## Example Output
 
+![Portfolio Dashboard Example](img/balance_censored.png)
+
+<details>
+<summary>Click to see text output</summary>
+
 ```
-CRYPTO PORTFOLIO DASHBOARD
-Total Value: $5,868.50  (Bitso: $2,428.10 + Cold: $3,440.40)
-Total Invested: $5,475.24
-P&L: $393.26 (+7.18%)
+Fetching live prices from CoinGecko...
+Fetched prices for 15 cryptocurrencies
+Fetching live USDT/MXN rate from Bitso...
+Live USDT/MXN rate: 20.15
+
+╔════════════════════════════════════════════════════════════╗
+║ CRYPTO PORTFOLIO DASHBOARD                                 ║
+║ Total Value: $12,458.32  (Bitso: $8,234.15 + Cold: $4,224.17)║
+║ Total Invested: $10,500.00                                 ║
+║ P&L: $1,958.32 (+18.65%)                                   ║
+╚════════════════════════════════════════════════════════════╝
+
+Deposits Summary (Historical - What You Put In)
+Type                    Amount              Notes
+MXN Deposited          150,000.00 MXN      Via SPEI transfers
+USDT Deposited         2500.00000000 USDT  Direct USDT transfers
+BTC Deposited          0.00250000 BTC      Direct BTC transfers
+Current MXN/USDT Rate  20.15               Live from Bitso API
 
 Bitso Exchange Holdings
-Currency    Balance      Price (USD)   USD Value   % Total
-BTC         0.01535432   $93,375       $1,433.71   24.4%
-MXN         10,642.82    $0.0492       $524.07     8.9%
-ETH         0.14946025   $3,147        $470.31     8.0%
+Currency  Balance      Price (USD)  USD Value  % Total
+BTC       0.05240000   $92,500      $4,847.00  38.9%
+ETH       0.85000000   $3,200       $2,720.00  21.8%
+SOL       25.50000000  $98.50       $2,511.75  20.2%
+MXN       12,450.00    $0.0496      $617.52    5.0%
+USDT      537.88       $1.00        $537.88    4.3%
 
 Cold Wallet Holdings
-Currency    Balance      Price (USD)   USD Value   % Total
-BTC         0.03684500   $93,375       $3,440.40   58.6%
+Currency  Balance      Price (USD)  USD Value  % Total
+BTC       0.04500000   $92,500      $4,162.50  33.4%
+DOT       150.00000000 $4.12        $618.00    5.0%
 
 Average Buy Prices & P&L
-Asset   Avg Buy Price   Current Price   Total Holdings   Unrealized P&L
-BTC     $101,645.67     $93,375.00     0.05219932       -$431.72
-ETH     $2,995.16       $3,146.75      0.14946025       +$22.66
+Asset  Avg Buy Price  Current Price  Total Holdings  Unrealized P&L
+BTC    $85,230.50     $92,500.00    0.09740000      +$708.28
+ETH    $2,850.25      $3,200.00     0.85000000      +$297.29
+SOL    $95.40         $98.50        25.50000000     +$79.05
+DOT    $3.95          $4.12         150.00000000    +$25.50
 ```
+
+</details>
 
 ## Customization
 
-Edit `balance_improved.py` to:
+Edit `balance.py` to:
 - Change colors or formatting
 - Add more metrics
 - Filter different holdings
@@ -194,7 +196,7 @@ pip install -r requirements.txt
 
 5. Run the tracker:
 ```bash
-python3 balance_improved.py --live-prices
+python3 balance.py
 ```
 
 ## Dependencies

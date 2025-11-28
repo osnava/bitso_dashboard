@@ -1,5 +1,6 @@
 # Python
 venv/
+bitso/
 __pycache__/
 *.py[cod]
 *$py.class

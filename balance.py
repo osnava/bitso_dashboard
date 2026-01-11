@@ -8,9 +8,11 @@ import csv
 import json
 import argparse
 import requests
+import yfinance as yf
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+from datetime import datetime
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -19,6 +21,8 @@ from rich import box
 
 console = Console()
 COLD_WALLET_FILE = Path('cold_wallet.json')
+STOCKS_FILE = Path('stocks.json')
+EXCHANGE_RATES_FILE = Path('exchange_rates.json')
 
 COIN_IDS = {
     'btc': 'bitcoin',
@@ -74,6 +78,113 @@ def fetch_live_usdt_mxn_rate() -> float:
         return last_price
 
     raise Exception("Failed to fetch USDT/MXN rate from Bitso API")
+
+
+def load_stocks() -> List[Dict]:
+    """Load stock transactions from JSON file."""
+    if STOCKS_FILE.exists():
+        with open(STOCKS_FILE, 'r') as f:
+            data = json.load(f)
+            return data.get('transactions', [])
+    return []
+
+
+def fetch_stock_prices(tickers: List[str]) -> Dict[str, float]:
+    """Fetch current USD prices for stocks using yfinance."""
+    if not tickers:
+        return {}
+
+    prices = {}
+    try:
+        for ticker in tickers:
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            # Get current price from various possible fields
+            current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
+            if current_price:
+                prices[ticker.upper()] = float(current_price)
+    except Exception as e:
+        console.print(f"Warning: Failed to fetch price for some stocks: {str(e)}", style="yellow")
+
+    return prices
+
+
+def load_exchange_rates() -> Dict[str, float]:
+    """Load cached exchange rates from JSON file."""
+    if EXCHANGE_RATES_FILE.exists():
+        with open(EXCHANGE_RATES_FILE, 'r') as f:
+            data = json.load(f)
+            return data.get('rates', {})
+    return {}
+
+
+def save_exchange_rates(rates: Dict[str, float]) -> None:
+    """Save exchange rates to JSON file."""
+    data = {
+        'rates': rates,
+        'notes': 'Historical USD/MXN exchange rates. Format: "YYYY-MM-DD": rate (1 USD = X MXN)',
+        'last_updated': datetime.now().isoformat()
+    }
+    with open(EXCHANGE_RATES_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def fetch_historical_usd_mxn_rate(date_str: str) -> Optional[float]:
+    """
+    Fetch historical USD/MXN rate for a specific date from Frankfurter API.
+    Date format: YYYY-MM-DD
+    Returns rate where 1 USD = X MXN
+    """
+    try:
+        # Frankfurter API - free, no auth required, supports historical data
+        url = f'https://api.frankfurter.app/{date_str}'
+        response = requests.get(url, timeout=10)
+
+        if response.status_code == 200:
+            data = response.json()
+            # Frankfurter returns EUR-based rates
+            # We need to convert: USD/MXN = (EUR/MXN) / (EUR/USD)
+            if 'rates' in data:
+                eur_mxn = data['rates'].get('MXN')
+                eur_usd = data['rates'].get('USD')
+
+                if eur_mxn and eur_usd:
+                    # Calculate USD/MXN rate
+                    usd_mxn = float(eur_mxn) / float(eur_usd)
+                    return usd_mxn
+
+    except Exception as e:
+        # Silently fall back to current rate
+        pass
+
+    return None
+
+
+def get_usd_mxn_rate_for_date(timestamp: float, current_rate: float) -> float:
+    """
+    Get USD/MXN exchange rate for a specific timestamp.
+    First checks cache, then tries to fetch from API, falls back to current rate.
+    Returns rate where 1 USD = X MXN
+    """
+    # Convert timestamp to date string
+    date_str = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d')
+
+    # Check cache first
+    rates_cache = load_exchange_rates()
+    if date_str in rates_cache:
+        return rates_cache[date_str]
+
+    # Try to fetch from API
+    historical_rate = fetch_historical_usd_mxn_rate(date_str)
+
+    if historical_rate:
+        # Save to cache
+        rates_cache[date_str] = historical_rate
+        save_exchange_rates(rates_cache)
+        return historical_rate
+
+    # Fall back to current rate
+    return current_rate
 
 
 def safe_float(value: str) -> float:
@@ -157,8 +268,11 @@ class EnhancedBalanceCalculator:
         self.trades: List[Dict] = []
         self.conversions: List[Dict] = []
         self.funding: Dict[str, float] = defaultdict(float)
+        self.funding_transactions: List[Dict] = []  # Track funding with timestamps
         self.live_prices: Dict[str, float] = {}
         self.live_usdt_mxn_rate: Optional[float] = None
+        self.stock_transactions: List[Dict] = []
+        self.stock_prices: Dict[str, float] = {}
 
         console.print("Fetching live prices from CoinGecko...", style="cyan")
         try:
@@ -178,22 +292,45 @@ class EnhancedBalanceCalculator:
             console.print(f"Error: {str(e)}\n", style="red")
             raise SystemExit(1)
 
+        # Load and fetch stock prices
+        self.stock_transactions = load_stocks()
+        if self.stock_transactions:
+            tickers = list(set(t['ticker'] for t in self.stock_transactions))
+            console.print(f"Fetching stock prices for {len(tickers)} ticker(s)...", style="cyan")
+            try:
+                self.stock_prices = fetch_stock_prices(tickers)
+                console.print(f"Fetched prices for {len(self.stock_prices)} stock(s)\n", style="green")
+            except Exception as e:
+                console.print(f"Warning: Failed to fetch stock prices: {str(e)}\n", style="yellow")
+
     def process_funding(self, filepath: Path) -> None:
         """Process funding transactions from CSV."""
         with open(filepath, newline='', encoding='utf-8') as f:
             for row in csv.DictReader(f):
                 method = row['method'].lower()
                 currency = row['currency'].lower()
+                timestamp = safe_float(row['timestamp'])
 
                 if method == 'earnings':
                     gross = safe_float(row['gross'])
+                    amount = gross
                     self.inflow[currency] += gross
                     self.funding[currency] += gross
                 else:
                     net_amount = safe_float(row['net amount'])
+                    amount = net_amount
                     if net_amount > 0:
                         self.inflow[currency] += net_amount
                         self.funding[currency] += net_amount
+
+                # Store funding transaction with timestamp for historical rate lookup
+                if amount > 0:
+                    self.funding_transactions.append({
+                        'method': method,
+                        'currency': currency,
+                        'amount': amount,
+                        'timestamp': timestamp
+                    })
 
     def process_conversions(self, filepath: Path) -> None:
         """Process currency conversions from CSV."""
@@ -224,6 +361,7 @@ class EnhancedBalanceCalculator:
                 fee = safe_float(row['fee'])
                 total = safe_float(row['total'])
                 rate = safe_float(row['rate'])
+                timestamp = safe_float(row['timestamp'])
 
                 if trade_type == 'buy':
                     self.inflow[major] += total
@@ -242,7 +380,8 @@ class EnhancedBalanceCalculator:
                     'value': value,
                     'rate': rate,
                     'fee': fee,
-                    'total': total
+                    'total': total,
+                    'timestamp': timestamp
                 })
 
     def process_withdrawals(self, filepath: Path) -> None:
@@ -296,7 +435,10 @@ class EnhancedBalanceCalculator:
         if not all_trades:
             return 0.0, 0.0
 
-        mxn_rate = self.get_mxn_to_usdt_rate()
+        # Sort trades chronologically (oldest first) for correct weighted average
+        all_trades = sorted(all_trades, key=lambda t: t.get('timestamp', 0))
+
+        current_mxn_rate = self.get_mxn_to_usdt_rate()
         total_cost_basis = 0.0
         total_holdings = 0.0
 
@@ -307,11 +449,14 @@ class EnhancedBalanceCalculator:
                 amount = trade['total']
                 value = trade['value']
                 minor = trade['minor']
+                timestamp = trade.get('timestamp', 0)
 
                 if minor == 'usdt':
                     value_usdt = value
                 elif minor == 'mxn':
-                    value_usdt = value / mxn_rate
+                    # Use historical rate for this specific trade
+                    historical_rate = get_usd_mxn_rate_for_date(timestamp, current_mxn_rate)
+                    value_usdt = value / historical_rate
                 elif minor == 'usd':
                     value_usdt = value
                 else:
@@ -334,25 +479,117 @@ class EnhancedBalanceCalculator:
         return 0.0, 0.0
 
     def get_total_invested(self) -> float:
-        """Calculate total invested in USD from initial deposits."""
-        mxn_deposited = self.funding.get('mxn', 0)
-        usdt_deposited = self.funding.get('usdt', 0)
-        usd_deposited = self.funding.get('usd', 0)
-        btc_deposited = self.funding.get('btc', 0)
+        """Calculate total invested in USD from initial deposits using historical rates."""
+        current_mxn_rate = self.get_mxn_to_usdt_rate()
+        total_usd = 0.0
 
-        mxn_rate = self.get_mxn_to_usdt_rate()
-        total_usd = (mxn_deposited / mxn_rate) + usdt_deposited + usd_deposited
+        # Process funding transactions with historical rates
+        for funding in self.funding_transactions:
+            currency = funding['currency']
+            amount = funding['amount']
+            timestamp = funding.get('timestamp', 0)
 
-        if btc_deposited > 0:
-            btc_price = self.get_latest_price_usdt('btc')
-            total_usd += btc_deposited * btc_price
+            if currency == 'mxn':
+                # Use historical rate for this deposit
+                historical_rate = get_usd_mxn_rate_for_date(timestamp, current_mxn_rate)
+                total_usd += amount / historical_rate
+            elif currency == 'usdt':
+                total_usd += amount
+            elif currency == 'usd':
+                total_usd += amount
+            elif currency == 'btc':
+                # Use current BTC price for BTC deposits
+                btc_price = self.get_latest_price_usdt('btc')
+                total_usd += amount * btc_price
+
+        # Add stock investments with historical rates
+        for transaction in self.stock_transactions:
+            if transaction['operation'] == 'buy':
+                cost = transaction['total_cost']
+                currency = transaction['currency'].lower()
+                timestamp = transaction.get('timestamp', 0)
+
+                if currency == 'mxn':
+                    historical_rate = get_usd_mxn_rate_for_date(timestamp, current_mxn_rate)
+                    total_usd += cost / historical_rate
+                elif currency == 'usd':
+                    total_usd += cost
+                elif currency == 'usdt':
+                    total_usd += cost
 
         return total_usd
+
+    def get_stock_balances(self) -> Dict[str, float]:
+        """Calculate total shares per stock ticker."""
+        balances = defaultdict(float)
+        for transaction in self.stock_transactions:
+            ticker = transaction['ticker'].upper()
+            shares = transaction['shares']
+            if transaction['operation'] == 'buy':
+                balances[ticker] += shares
+            elif transaction['operation'] == 'sell':
+                balances[ticker] -= shares
+        return dict(balances)
+
+    def get_stock_average_buy_price(self, ticker: str) -> Tuple[float, float]:
+        """Calculate weighted average cost basis for stock in USD."""
+        ticker = ticker.upper()
+        transactions = [t for t in self.stock_transactions if t['ticker'].upper() == ticker]
+
+        if not transactions:
+            return 0.0, 0.0
+
+        # Sort transactions chronologically (oldest first) for correct weighted average
+        transactions = sorted(transactions, key=lambda t: t.get('timestamp', 0))
+
+        current_mxn_rate = self.get_mxn_to_usdt_rate()
+        total_cost_basis = 0.0
+        total_shares = 0.0
+
+        for transaction in transactions:
+            operation = transaction['operation']
+            shares = transaction['shares']
+            cost = transaction['total_cost']
+            currency = transaction['currency'].lower()
+            timestamp = transaction.get('timestamp', 0)
+
+            # Convert cost to USD using historical rate
+            if currency == 'mxn':
+                historical_rate = get_usd_mxn_rate_for_date(timestamp, current_mxn_rate)
+                cost_usd = cost / historical_rate
+            elif currency == 'usd':
+                cost_usd = cost
+            elif currency == 'usdt':
+                cost_usd = cost
+            else:
+                continue
+
+            if operation == 'buy':
+                total_cost_basis += cost_usd
+                total_shares += shares
+            elif operation == 'sell':
+                if total_shares > 0:
+                    avg_cost_at_sale = total_cost_basis / total_shares
+                    cost_of_sold = avg_cost_at_sale * shares
+                    total_cost_basis -= cost_of_sold
+                    total_shares -= shares
+
+        if total_shares > 0 and total_cost_basis > 0:
+            return total_cost_basis / total_shares, total_shares
+        return 0.0, 0.0
+
+    def get_stock_usd_value(self, ticker: str, shares: float) -> float:
+        """Calculate USD value for shares of stock."""
+        ticker = ticker.upper()
+        if ticker in self.stock_prices:
+            return shares * self.stock_prices[ticker]
+        return 0.0
 
     def print_enhanced_report(self) -> None:
         """Print portfolio report with tables."""
         balances = self.get_balances()
         cold_wallet = load_cold_wallet()
+        stock_balances = self.get_stock_balances()
 
         bitso_total_usd = sum(
             self.get_usd_value(curr, bal)
@@ -366,18 +603,26 @@ class EnhancedBalanceCalculator:
             if bal > 0.00001
         )
 
-        total_portfolio_usd = bitso_total_usd + cold_wallet_total_usd
+        stocks_total_usd = sum(
+            self.get_stock_usd_value(ticker, shares)
+            for ticker, shares in stock_balances.items()
+            if shares > 0.0001
+        )
+
+        total_portfolio_usd = bitso_total_usd + cold_wallet_total_usd + stocks_total_usd
         total_invested = self.get_total_invested()
         total_pnl = total_portfolio_usd - total_invested
         roi_pct = (total_pnl / total_invested * 100) if total_invested > 0 else 0
 
         header_text = Text()
-        header_text.append("CRYPTO PORTFOLIO DASHBOARD\n", style="bold cyan")
+        header_text.append("CRYPTO & STOCKS PORTFOLIO DASHBOARD\n", style="bold cyan")
         header_text.append(f"Total Value: ", style="white")
         header_text.append(f"${total_portfolio_usd:,.2f}", style="bold green")
         header_text.append(f"  (Bitso: ${bitso_total_usd:,.2f}", style="dim")
         if cold_wallet_total_usd > 0:
             header_text.append(f" + Cold: ${cold_wallet_total_usd:,.2f}", style="dim cyan")
+        if stocks_total_usd > 0:
+            header_text.append(f" + Stocks: ${stocks_total_usd:,.2f}", style="dim magenta")
         header_text.append(")\n", style="dim")
         header_text.append(f"Total Invested: ", style="white")
         header_text.append(f"${total_invested:,.2f}\n", style="white")
@@ -539,8 +784,55 @@ class EnhancedBalanceCalculator:
             console.print(cold_table)
             console.print()
 
+        # Stock/ETF Holdings Table
+        if stock_balances:
+            stocks_table = Table(
+                title="Stock/ETF Holdings",
+                box=box.ROUNDED,
+                show_header=True,
+                header_style="bold magenta"
+            )
+
+            stocks_table.add_column("Ticker", style="magenta", justify="left")
+            stocks_table.add_column("Name", style="white", justify="left")
+            stocks_table.add_column("Shares", justify="right", style="white")
+            stocks_table.add_column("Price (USD)", justify="right", style="cyan")
+            stocks_table.add_column("USD Value", justify="right", style="green")
+            stocks_table.add_column("% Total", justify="right", style="yellow")
+
+            # Sort stocks by USD value
+            sorted_stocks = sorted(
+                [(ticker, shares) for ticker, shares in stock_balances.items() if shares > 0.0001],
+                key=lambda x: self.get_stock_usd_value(x[0], x[1]),
+                reverse=True
+            )
+
+            for ticker, shares in sorted_stocks:
+                usd_value = self.get_stock_usd_value(ticker, shares)
+                pct = (usd_value / total_portfolio_usd * 100) if total_portfolio_usd > 0 else 0
+                price = self.stock_prices.get(ticker, 0.0)
+
+                # Get stock name from transactions
+                stock_name = ""
+                for t in self.stock_transactions:
+                    if t['ticker'].upper() == ticker:
+                        stock_name = t.get('name', ticker)
+                        break
+
+                stocks_table.add_row(
+                    ticker,
+                    stock_name[:40] if len(stock_name) > 40 else stock_name,
+                    f"{shares:.4f}",
+                    f"${price:,.2f}",
+                    f"${usd_value:,.2f}",
+                    f"{pct:.1f}%"
+                )
+
+            console.print(stocks_table)
+            console.print()
+
         total_table = Table(
-            title="Total Portfolio (Bitso + Cold Wallet)",
+            title="Total Portfolio (Bitso + Cold Wallet + Stocks)",
             box=box.ROUNDED,
             show_header=True,
             header_style="bold cyan"
@@ -672,6 +964,58 @@ class EnhancedBalanceCalculator:
                     )
 
             console.print(avg_table)
+            console.print()
+
+        # Stock Average Buy Prices & P&L
+        if stock_balances:
+            stock_pnl_table = Table(
+                title="Stock/ETF Average Buy Prices & P&L",
+                box=box.ROUNDED,
+                show_header=True,
+                header_style="bold magenta"
+            )
+
+            stock_pnl_table.add_column("Ticker", style="magenta")
+            stock_pnl_table.add_column("Name", style="white")
+            stock_pnl_table.add_column("Avg Buy Price", justify="right", style="white")
+            stock_pnl_table.add_column("Current Price", justify="right", style="white")
+            stock_pnl_table.add_column("Total Shares", justify="right", style="white")
+            stock_pnl_table.add_column("Unrealized P&L", justify="right")
+
+            # Sort by USD value for consistency
+            sorted_stocks = sorted(
+                stock_balances.items(),
+                key=lambda x: self.get_stock_usd_value(x[0], x[1]),
+                reverse=True
+            )
+
+            for ticker, shares in sorted_stocks:
+                if shares > 0.0001:
+                    avg_price, _ = self.get_stock_average_buy_price(ticker)
+                    current_price = self.stock_prices.get(ticker, 0.0)
+
+                    # Get stock name
+                    stock_name = ""
+                    for t in self.stock_transactions:
+                        if t['ticker'].upper() == ticker:
+                            stock_name = t.get('name', ticker)
+                            break
+
+                    if avg_price > 0 and current_price > 0:
+                        unrealized_pnl = (current_price - avg_price) * shares
+                        pnl_color = "green" if unrealized_pnl >= 0 else "red"
+                        pnl_sign = "+" if unrealized_pnl >= 0 else ""
+
+                        stock_pnl_table.add_row(
+                            ticker,
+                            stock_name[:30] if len(stock_name) > 30 else stock_name,
+                            f"${avg_price:,.2f}",
+                            f"${current_price:,.2f}",
+                            f"{shares:.4f}",
+                            f"[{pnl_color}]{pnl_sign}${unrealized_pnl:,.2f}[/{pnl_color}]"
+                        )
+
+            console.print(stock_pnl_table)
             console.print()
 
         fees_table = Table(

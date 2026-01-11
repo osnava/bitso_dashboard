@@ -26,6 +26,8 @@ wheels/
 # User data
 *.csv
 cold_wallet.json
+stocks.json
+exchange_rates.json
 
 # IDE
 .vscode/
@@ -34,6 +36,7 @@ cold_wallet.json
 *.swo
 *~
 .DS_Store
+*:Zone.Identifier
 
 # Claude Code
 .claude/
